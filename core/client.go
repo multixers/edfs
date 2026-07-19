@@ -82,10 +82,12 @@ type Client struct {
 }
 
 type FileMeta struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"` // "file" | "folder"
-	Size      int64  `json:"size"`
-	UpdatedAt string `json:"updated_at"`
+	Name      string  `json:"name"`
+	Type      string  `json:"type"` // "file" | "folder" | "symlink"
+	Size      int64   `json:"size"`
+	Mode      *uint32 `json:"mode"`   // unix perm bits; nil = server has none, use a default
+	Target    string  `json:"target"` // link target, set only for type=="symlink"
+	UpdatedAt string  `json:"updated_at"`
 }
 
 func NewClient(baseURL, token string) *Client {
@@ -289,6 +291,53 @@ func (c *Client) Write(filePath string, content []byte, mime string) error {
 		Size:      int64(len(content)),
 		UpdatedAt: time.Now().Format(time.RFC3339),
 	})
+	c.listCache.delete(parent(filePath))
+	return nil
+}
+
+// Chmod persists a file's unix permission bits (backs the chmod() syscall, so
+// `chmod +x` survives across sessions). Only the low 12 bits are kept.
+func (c *Client) Chmod(filePath string, mode uint32) error {
+	resp, err := c.do("POST", "/api/fuse/chmod", map[string]any{
+		"path": filePath,
+		"mode": mode & 0o7777,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return ErrNotFound
+	}
+	if resp.StatusCode == 403 {
+		return ErrForbidden
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("chmod %s: HTTP %d", filePath, resp.StatusCode)
+	}
+	c.statCache.delete(filePath)
+	c.listCache.delete(parent(filePath))
+	return nil
+}
+
+// Symlink creates a symbolic link at filePath pointing to target (the raw
+// target string, unresolved — POSIX symlink semantics).
+func (c *Client) Symlink(filePath, target string) error {
+	resp, err := c.do("POST", "/api/fuse/symlink", map[string]string{
+		"path":   filePath,
+		"target": target,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 403 {
+		return ErrForbidden
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("symlink %s -> %s: HTTP %d: %s", filePath, target, resp.StatusCode, body)
+	}
 	c.listCache.delete(parent(filePath))
 	return nil
 }

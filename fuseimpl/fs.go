@@ -94,6 +94,8 @@ var _ fs.NodeMkdirer = (*Node)(nil)
 var _ fs.NodeUnlinker = (*Node)(nil)
 var _ fs.NodeRmdirer = (*Node)(nil)
 var _ fs.NodeRenamer = (*Node)(nil)
+var _ fs.NodeReadlinker = (*Node)(nil)
+var _ fs.NodeSymlinker = (*Node)(nil)
 
 // mapErrno turns a core client error into the closest POSIX errno so tools see
 // "no such file" / "permission denied" instead of a blanket I/O error.
@@ -142,12 +144,11 @@ func (n *Node) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	return fs.OK
 }
 
-// Setattr backs chmod/chown/truncate/utimes. Only a size change is real — it
-// truncates the file's bytes server-side (or the open write buffer). Mode,
-// owner and timestamps are accepted but NOT persisted: Storage has no unix
-// permission/owner model and mtime is the record's updated_at. Accepting them
-// (instead of ENOSYS/EPERM) is what lets `cp -p`, tar, git checkout and editors
-// finish without spurious errors.
+// Setattr backs chmod/chown/truncate/utimes. Size (truncate) and mode (chmod)
+// are real and persisted; owner and timestamps are accepted but NOT persisted
+// (Storage has no unix owner model and mtime is the record's updated_at).
+// Accepting the latter (instead of ENOSYS/EPERM) is what lets `cp -p`, tar, git
+// checkout and editors finish without spurious errors.
 func (n *Node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	if sz, ok := in.GetSize(); ok {
 		if wh, isWrite := fh.(*WriteHandle); isWrite {
@@ -155,6 +156,14 @@ func (n *Node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		} else if err := n.client.Truncate(n.path, int64(sz)); err != nil {
 			if !errors.Is(err, core.ErrNotFound) {
 				log.Printf("ERR truncate %s: %v", n.path, err)
+			}
+			return mapErrno(err)
+		}
+	}
+	if m, ok := in.GetMode(); ok {
+		if err := n.client.Chmod(n.path, m); err != nil {
+			if !errors.Is(err, core.ErrNotFound) {
+				log.Printf("ERR chmod %s: %v", n.path, err)
 			}
 			return mapErrno(err)
 		}
@@ -214,8 +223,11 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	dirEntries := make([]fuse.DirEntry, 0, len(entries))
 	for _, e := range entries {
 		mode := uint32(0644)
-		if e.Type == "folder" {
+		switch e.Type {
+		case "folder":
 			mode = 0755 | syscall.S_IFDIR
+		case "symlink":
+			mode = syscall.S_IFLNK | 0o777
 		}
 		dirEntries = append(dirEntries, fuse.DirEntry{
 			Name: e.Name,
@@ -303,6 +315,37 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return mapErrno(err)
 	}
 	return fs.OK
+}
+
+// Readlink returns a symlink's target (the raw stored string; the kernel
+// resolves it). Backs readlink()/lstat on a symlink node.
+func (n *Node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
+	meta, err := n.client.Stat(n.path)
+	if err != nil {
+		return nil, mapErrno(err)
+	}
+	return []byte(meta.Target), fs.OK
+}
+
+// Symlink creates a symbolic link `name` → `target` under this dir. Backs the
+// symlink() syscall (used by pnpm, .venv, `ln -s`, ...).
+func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	childPath := n.childPath(name)
+	if err := n.client.Symlink(childPath, target); err != nil {
+		log.Printf("ERR symlink %s -> %s: %v", childPath, target, err)
+		return nil, mapErrno(err)
+	}
+
+	out.EntryValid = 5
+	out.AttrValid = 5
+	out.Uid = myUID
+	out.Gid = myGID
+	out.Mode = syscall.S_IFLNK | 0o777
+	out.Size = uint64(len(target))
+
+	child := &Node{client: n.client, local: n.local, path: childPath}
+	stable := fs.StableAttr{Mode: syscall.S_IFLNK, Ino: pathIno(childPath)}
+	return n.NewInode(ctx, child, stable), fs.OK
 }
 
 func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
@@ -399,6 +442,7 @@ type WriteHandle struct {
 
 var _ fs.FileWriter = (*WriteHandle)(nil)
 var _ fs.FileFlusher = (*WriteHandle)(nil)
+var _ fs.FileFsyncer = (*WriteHandle)(nil)
 
 func (f *WriteHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	f.mu.Lock()
@@ -439,16 +483,42 @@ func (f *WriteHandle) Flush(ctx context.Context) syscall.Errno {
 	return fs.OK
 }
 
+// Fsync durably persists the pending buffer on fsync(), not only on close, so a
+// program that fsyncs to guarantee its data is saved actually gets that
+// guarantee (editors, and anything that writes-then-fsyncs before proceeding).
+func (f *WriteHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.client.Write(f.path, f.buf, f.mime); err != nil {
+		log.Printf("ERR fsync %s: %v", f.path, err)
+		return mapErrno(err)
+	}
+	return fs.OK
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func fillAttr(out *fuse.Attr, meta *core.FileMeta) {
 	out.Uid = myUID
 	out.Gid = myGID
-	if meta.Type == "folder" {
-		out.Mode = 0755 | syscall.S_IFDIR
+	switch meta.Type {
+	case "folder":
+		perm := uint32(0755)
+		if meta.Mode != nil {
+			perm = *meta.Mode & 0o7777
+		}
+		out.Mode = perm | syscall.S_IFDIR
 		out.Nlink = 2
-	} else {
-		out.Mode = 0644
+	case "symlink":
+		out.Mode = syscall.S_IFLNK | 0o777 // symlinks carry all perms; the target governs access
+		out.Size = uint64(len(meta.Target))
+		out.Nlink = 1
+	default: // file
+		perm := uint32(0644)
+		if meta.Mode != nil {
+			perm = *meta.Mode & 0o7777
+		}
+		out.Mode = perm
 		out.Size = uint64(meta.Size)
 		out.Nlink = 1
 	}
