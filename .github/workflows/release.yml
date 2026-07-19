@@ -1,0 +1,36 @@
+name: release
+
+# Tag a version to cut a release: `git tag v0.1.0 && git push --tags`.
+# Builds the static edfs binary, packages it as a .deb, and attaches it to the
+# GitHub Release for that tag.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create the release + upload the .deb
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build edfs (static, no cgo)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o edfs ./linux
+
+      - name: Package .deb
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          VERSION="${GITHUB_REF_NAME#v}" \
+            nfpm pkg --packager deb --config packaging/nfpm.yaml \
+              --target "eidos-edfs_${GITHUB_REF_NAME#v}_amd64.deb"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.deb'

@@ -1,0 +1,22 @@
+# nfpm config for the eidos-edfs .deb.
+# Built in CI, then `apt install`ed on a sandbox host. Declares fuse3 so apt
+# pulls the FUSE userspace automatically.
+#   VERSION=0.1.0 nfpm pkg --packager deb --config packaging/nfpm.yaml
+name: eidos-edfs
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: multixers
+description: |
+  eidos filesystem driver — mounts a user's cloud Storage as a POSIX filesystem
+  over the Laravel /api/fuse contract. Runs on the sandbox host; the container
+  server execs it.
+homepage: https://github.com/multixers/edfs
+license: MIT
+depends:
+  - fuse3
+contents:
+  - src: ./edfs                       # the binary, built in the workflow
+    dst: /usr/local/bin/edfs
