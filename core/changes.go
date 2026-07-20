@@ -144,8 +144,6 @@ func (c *Client) streamChanges(ctx context.Context, cfg *Config, onChange func(C
 		return err
 	}
 
-	log.Printf("changes: watching %s", cfg.Changes.Channel)
-
 	for {
 		var msg pusherMessage
 		if err := conn.ReadJSON(&msg); err != nil {
@@ -157,6 +155,15 @@ func (c *Client) streamChanges(ctx context.Context, cfg *Config, onChange func(C
 			_ = conn.WriteJSON(map[string]any{"event": "pusher:pong"})
 		case "pusher:error":
 			return fmt.Errorf("server: %s", msg.Data)
+
+		// Only now is the subscription real. Announcing it when the request was
+		// merely *sent* would report a working feed even when the server rejected
+		// it, which is the sort of thing that turns into an hour of confusion.
+		case "pusher_internal:subscription_succeeded":
+			log.Printf("changes: watching %s", cfg.Changes.Channel)
+		case "pusher_internal:subscription_error", "pusher:subscription_error":
+			return fmt.Errorf("subscribe %s rejected: %s", cfg.Changes.Channel, msg.Data)
+
 		case cfg.Changes.Event:
 			var ch Change
 			if err := decodePusherData(msg.Data, &ch); err != nil {
@@ -166,11 +173,17 @@ func (c *Client) streamChanges(ctx context.Context, cfg *Config, onChange func(C
 			if ch.Origin != 0 && ch.Origin == cfg.Origin {
 				continue // our own write coming back to us
 			}
+			log.Printf("changes: %s %s", ch.Op, ch.Path)
 			c.Invalidate(ch.Path)
 			c.Invalidate(ch.From)
 			if onChange != nil {
 				onChange(ch)
 			}
+
+		default:
+			// The feed is low volume, so surfacing anything unrecognised is cheap
+			// and saves guessing when the server and driver disagree.
+			log.Printf("changes: unhandled %q on %q: %s", msg.Event, msg.Channel, msg.Data)
 		}
 	}
 }
