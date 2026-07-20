@@ -342,6 +342,45 @@ func (c *Client) Symlink(filePath, target string) error {
 	return nil
 }
 
+// WriteStream uploads a file by streaming the raw request body to the chunked
+// server endpoint — no base64, no whole-file buffer — so a large write never
+// sits whole in memory. size bytes are sent from r. Uses a dedicated client
+// without the short read timeout, since a big upload legitimately takes a while.
+func (c *Client) WriteStream(filePath string, r io.Reader, size int64, mimeType string) error {
+	if mimeType == "" {
+		mimeType = "text/plain"
+	}
+	u := c.baseURL + "/api/fuse/write-stream?path=" + url.QueryEscape(filePath) + "&mime=" + url.QueryEscape(mimeType)
+	req, err := http.NewRequest("POST", u, io.LimitReader(r, size))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = size
+	req.Header.Set("Authorization", "Bearer "+c.token)
+
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 403 {
+		return ErrForbidden
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("write-stream %s: HTTP %d: %s", filePath, resp.StatusCode, body)
+	}
+
+	c.statCache.set(filePath, &FileMeta{
+		Name:      filepath.Base(filePath),
+		Type:      "file",
+		Size:      size,
+		UpdatedAt: time.Now().Format(time.RFC3339),
+	})
+	c.listCache.delete(parent(filePath))
+	return nil
+}
+
 func (c *Client) Mkdir(filePath string) error {
 	resp, err := c.do("POST", "/api/fuse/mkdir", map[string]string{"path": filePath})
 	if err != nil {

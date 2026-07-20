@@ -3,6 +3,7 @@ package fuseimpl
 import (
 	"context"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -241,19 +242,21 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 {
-		wh := &WriteHandle{client: n.client, path: n.path, mime: core.MimeFromName(n.path)}
+		wh, err := newWriteHandle(n.client, n.path, core.MimeFromName(n.path))
+		if err != nil {
+			log.Printf("ERR open-tmp %s: %v", n.path, err)
+			return nil, 0, syscall.EIO
+		}
 
-		// Seed the buffer with the file's current bytes UNLESS the caller asked
-		// to truncate it. Without this, a partial write (open existing file →
-		// seek → write a few bytes → close) would flush a buffer that is empty
-		// except for those bytes, silently dropping the rest of the file. Seeding
-		// makes in-place edits and appends correct, including sparse writes (the
-		// gap holds real content, not zeros).
+		// Seed the temp buffer with the file's current bytes UNLESS the caller
+		// asked to truncate it. Without this, a partial write (open → seek → write
+		// a few bytes → close) would flush a buffer empty except for those bytes,
+		// dropping the rest of the file. Seeding is windowed so a large in-place
+		// edit doesn't pull the whole file into memory.
 		if flags&syscall.O_TRUNC == 0 {
-			if data, err := n.client.Read(n.path); err == nil {
-				wh.buf = data
-			} else if !errors.Is(err, core.ErrNotFound) {
+			if err := wh.seed(); err != nil {
 				log.Printf("ERR open-seed %s: %v", n.path, err)
+				_ = wh.Release(ctx)
 				return nil, 0, mapErrno(err)
 			}
 		}
@@ -264,7 +267,11 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 
 func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	childPath := n.childPath(name)
-	fh := &WriteHandle{client: n.client, path: childPath, mime: core.MimeFromName(name)}
+	fh, err := newWriteHandle(n.client, childPath, core.MimeFromName(name))
+	if err != nil {
+		log.Printf("ERR create-tmp %s: %v", childPath, err)
+		return nil, nil, 0, syscall.EIO
+	}
 
 	out.EntryValid = 1
 	out.AttrValid = 1
@@ -432,66 +439,119 @@ func (f *ReadHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 
 // ── WriteHandle ───────────────────────────────────────────────────────────────
 
+// seedWindow bounds how much of an existing file is pulled at once when seeding
+// the temp buffer for an in-place edit.
+const seedWindow = 8 << 20 // 8 MiB
+
+// WriteHandle backs a writable file with a host temp file rather than an in-RAM
+// buffer, so writing a multi-GB file never balloons the process's memory. On
+// flush the temp file is streamed to the chunked-encryption endpoint.
 type WriteHandle struct {
 	client *core.Client
 	path   string
 	mime   string
 	mu     sync.Mutex
-	buf    []byte
+	tmp    *os.File
+	size   int64 // logical size = highest offset written (or truncated to)
 }
 
 var _ fs.FileWriter = (*WriteHandle)(nil)
 var _ fs.FileFlusher = (*WriteHandle)(nil)
 var _ fs.FileFsyncer = (*WriteHandle)(nil)
+var _ fs.FileReleaser = (*WriteHandle)(nil)
+
+func newWriteHandle(client *core.Client, path, mime string) (*WriteHandle, error) {
+	f, err := os.CreateTemp("", "edfs-w-")
+	if err != nil {
+		return nil, err
+	}
+	return &WriteHandle{client: client, path: path, mime: mime, tmp: f}, nil
+}
+
+// seed copies the file's current bytes into the temp buffer (for an in-place
+// edit that isn't a truncate), windowed so a large file isn't pulled whole into
+// memory. A missing file seeds nothing (a fresh write).
+func (f *WriteHandle) seed() error {
+	meta, err := f.client.Stat(f.path)
+	if err != nil {
+		if errors.Is(err, core.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	for off := int64(0); off < meta.Size; {
+		data, err := f.client.ReadRange(f.path, off, seedWindow)
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			break
+		}
+		if _, err := f.tmp.WriteAt(data, off); err != nil {
+			return err
+		}
+		off += int64(len(data))
+	}
+	f.size = meta.Size
+	return nil
+}
 
 func (f *WriteHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	end := int(off) + len(data)
-	if end > len(f.buf) {
-		newBuf := make([]byte, end)
-		copy(newBuf, f.buf)
-		f.buf = newBuf
+	n, err := f.tmp.WriteAt(data, off)
+	if err != nil {
+		log.Printf("ERR write-buf %s: %v", f.path, err)
+		return 0, syscall.EIO
 	}
-	copy(f.buf[off:], data)
-	return uint32(len(data)), fs.OK
+	if end := off + int64(n); end > f.size {
+		f.size = end
+	}
+	return uint32(n), fs.OK
 }
 
-// truncateBuf resizes the pending write buffer (shrink cuts, grow zero-fills).
-// Backs an ftruncate() on an open write handle so the truncation is folded into
-// the single flush rather than needing a separate server round trip.
+// truncateBuf resizes the pending temp buffer (shrink cuts, grow zero-fills, via
+// the sparse temp file). Backs an ftruncate() on an open write handle.
 func (f *WriteHandle) truncateBuf(size int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if size < int64(len(f.buf)) {
-		f.buf = f.buf[:size]
+	if err := f.tmp.Truncate(size); err != nil {
+		log.Printf("ERR truncate-buf %s: %v", f.path, err)
 		return
 	}
-	grown := make([]byte, size)
-	copy(grown, f.buf)
-	f.buf = grown
+	f.size = size
 }
 
-func (f *WriteHandle) Flush(ctx context.Context) syscall.Errno {
+func (f *WriteHandle) flush() syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.client.Write(f.path, f.buf, f.mime); err != nil {
+	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
+		log.Printf("ERR write-seek %s: %v", f.path, err)
+		return syscall.EIO
+	}
+	if err := f.client.WriteStream(f.path, f.tmp, f.size, f.mime); err != nil {
 		log.Printf("ERR write %s: %v", f.path, err)
 		return mapErrno(err)
 	}
 	return fs.OK
 }
 
-// Fsync durably persists the pending buffer on fsync(), not only on close, so a
-// program that fsyncs to guarantee its data is saved actually gets that
-// guarantee (editors, and anything that writes-then-fsyncs before proceeding).
-func (f *WriteHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+func (f *WriteHandle) Flush(ctx context.Context) syscall.Errno { return f.flush() }
+
+// Fsync durably persists on fsync(), not only on close, so a program that fsyncs
+// to guarantee its data is saved actually gets that guarantee.
+func (f *WriteHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno { return f.flush() }
+
+// Release drops the temp file when the last fd closes.
+func (f *WriteHandle) Release(ctx context.Context) syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if err := f.client.Write(f.path, f.buf, f.mime); err != nil {
-		log.Printf("ERR fsync %s: %v", f.path, err)
-		return mapErrno(err)
+	if f.tmp != nil {
+		name := f.tmp.Name()
+		_ = f.tmp.Close()
+		_ = os.Remove(name)
+		f.tmp = nil
 	}
 	return fs.OK
 }
