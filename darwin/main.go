@@ -59,12 +59,23 @@ func main() {
 		}
 	})
 
-	sig := make(chan os.Signal, 1)
+	sig := make(chan os.Signal, 2)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sig
 		stopWatching()
-		server.Unmount()
+
+		// Unmount refuses while anything is still using the mount — a shell sitting
+		// in it is enough. Say so instead of appearing to hang, and let a second
+		// interrupt give up on the clean exit.
+		if err := server.Unmount(); err != nil {
+			log.Printf("unmount %s: %v", *mount, err)
+			log.Printf("something is still using it; free it or run: umount -f %s", *mount)
+		}
+
+		<-sig
+		log.Printf("exiting without a clean unmount; run: umount -f %s", *mount)
+		os.Exit(1)
 	}()
 
 	server.Wait()
