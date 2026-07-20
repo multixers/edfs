@@ -134,6 +134,25 @@ func (n *Node) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	}
 
 	meta, err := n.client.Stat(n.path)
+
+	// An open write handle holds bytes the server hasn't seen yet, so it — not
+	// the server — knows the file's current length. Without this, fstat on a file
+	// being written reports its pre-flush size (and a freshly created one doesn't
+	// exist at all), which breaks any program that writes and then checks how big
+	// the file now is.
+	if wh, ok := fh.(*WriteHandle); ok {
+		if err != nil {
+			if !errors.Is(err, core.ErrNotFound) {
+				log.Printf("ERR getattr %s: %v", n.path, err)
+				return mapErrno(err)
+			}
+			meta = &core.FileMeta{Name: filepath.Base(n.path), Type: "file"}
+		}
+		fillAttr(&out.Attr, meta)
+		out.Size = uint64(wh.currentSize())
+		return fs.OK
+	}
+
 	if err != nil {
 		if !errors.Is(err, core.ErrNotFound) {
 			log.Printf("ERR getattr %s: %v", n.path, err)
@@ -458,6 +477,7 @@ type WriteHandle struct {
 	dirty bool
 }
 
+var _ fs.FileReader = (*WriteHandle)(nil)
 var _ fs.FileWriter = (*WriteHandle)(nil)
 var _ fs.FileFlusher = (*WriteHandle)(nil)
 var _ fs.FileFsyncer = (*WriteHandle)(nil)
@@ -506,6 +526,44 @@ func (f *WriteHandle) ensureLoaded() error {
 	}
 	f.size = meta.Size
 	return nil
+}
+
+// currentSize is the file's length as this handle sees it, including writes not
+// yet sent to the server.
+func (f *WriteHandle) currentSize() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Nothing has been touched yet, so the server's length is still the truth and
+	// loading the contents just to answer a stat would be wasteful.
+	if f.pending && !f.dirty {
+		if meta, err := f.client.Stat(f.path); err == nil {
+			return meta.Size
+		}
+	}
+	return f.size
+}
+
+// Read serves a file opened O_RDWR. Without it such a handle would be
+// write-only and every read on it would fail, which breaks anything that opens a
+// file read-write and reads back from it — databases, editors, any random-access
+// format. Reads come from the temp buffer, so they see this handle's own
+// unflushed writes, as a local file would.
+func (f *WriteHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if err := f.ensureLoaded(); err != nil {
+		log.Printf("ERR read-load %s: %v", f.path, err)
+		return nil, mapErrno(err)
+	}
+
+	n, err := f.tmp.ReadAt(dest, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("ERR read-buf %s: %v", f.path, err)
+		return nil, syscall.EIO
+	}
+	return fuse.ReadResultData(dest[:n]), fs.OK
 }
 
 func (f *WriteHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
