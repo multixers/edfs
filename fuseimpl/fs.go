@@ -242,23 +242,14 @@ func (n *Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if flags&(syscall.O_WRONLY|syscall.O_RDWR) != 0 {
-		wh, err := newWriteHandle(n.client, n.path, core.MimeFromName(n.path))
+		// The existing bytes may still be needed (a partial write keeps them), but
+		// they're fetched on demand rather than here: the kernel drops O_TRUNC from
+		// a FUSE open and truncates immediately afterwards, so seeding at open
+		// would read a whole file that's about to be thrown away.
+		wh, err := newWriteHandle(n.client, n.path, core.MimeFromName(n.path), flags&syscall.O_TRUNC == 0)
 		if err != nil {
 			log.Printf("ERR open-tmp %s: %v", n.path, err)
 			return nil, 0, syscall.EIO
-		}
-
-		// Seed the temp buffer with the file's current bytes UNLESS the caller
-		// asked to truncate it. Without this, a partial write (open → seek → write
-		// a few bytes → close) would flush a buffer empty except for those bytes,
-		// dropping the rest of the file. Seeding is windowed so a large in-place
-		// edit doesn't pull the whole file into memory.
-		if flags&syscall.O_TRUNC == 0 {
-			if err := wh.seed(); err != nil {
-				log.Printf("ERR open-seed %s: %v", n.path, err)
-				_ = wh.Release(ctx)
-				return nil, 0, mapErrno(err)
-			}
 		}
 		return wh, fuse.FOPEN_DIRECT_IO, fs.OK
 	}
@@ -267,7 +258,8 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 
 func (n *Node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	childPath := n.childPath(name)
-	fh, err := newWriteHandle(n.client, childPath, core.MimeFromName(name))
+	// A created file has no prior contents to preserve.
+	fh, err := newWriteHandle(n.client, childPath, core.MimeFromName(name), false)
 	if err != nil {
 		log.Printf("ERR create-tmp %s: %v", childPath, err)
 		return nil, nil, 0, syscall.EIO
@@ -453,6 +445,17 @@ type WriteHandle struct {
 	mu     sync.Mutex
 	tmp    *os.File
 	size   int64 // logical size = highest offset written (or truncated to)
+
+	// The file's existing bytes are loaded lazily — on the first write that could
+	// leave part of them intact, never at open. The kernel strips O_TRUNC from a
+	// FUSE open and truncates just *after* opening, so seeding eagerly would pull
+	// (and, for a `> file` redirect, immediately discard) the whole file. Loading
+	// on demand means an overwrite never reads what it's about to replace.
+	pending bool
+
+	// Nothing changed → nothing to upload. Without this, opening a file for
+	// writing and closing it untouched would flush an empty buffer over it.
+	dirty bool
 }
 
 var _ fs.FileWriter = (*WriteHandle)(nil)
@@ -460,22 +463,31 @@ var _ fs.FileFlusher = (*WriteHandle)(nil)
 var _ fs.FileFsyncer = (*WriteHandle)(nil)
 var _ fs.FileReleaser = (*WriteHandle)(nil)
 
-func newWriteHandle(client *core.Client, path, mime string) (*WriteHandle, error) {
+// newWriteHandle opens a write buffer. existing says the file may already have
+// contents worth preserving; they're fetched only if something actually needs
+// them (see WriteHandle.pending).
+func newWriteHandle(client *core.Client, path, mime string, existing bool) (*WriteHandle, error) {
 	f, err := os.CreateTemp("", "edfs-w-")
 	if err != nil {
 		return nil, err
 	}
-	return &WriteHandle{client: client, path: path, mime: mime, tmp: f}, nil
+	return &WriteHandle{client: client, path: path, mime: mime, tmp: f, pending: existing}, nil
 }
 
-// seed copies the file's current bytes into the temp buffer (for an in-place
-// edit that isn't a truncate), windowed so a large file isn't pulled whole into
-// memory. A missing file seeds nothing (a fresh write).
-func (f *WriteHandle) seed() error {
+// ensureLoaded copies the file's current bytes into the temp buffer, once,
+// windowed so a large file isn't pulled whole into memory. Without it a partial
+// write (open → seek → write a few bytes → close) would flush a buffer empty
+// except for those bytes, dropping the rest of the file. Caller holds mu.
+func (f *WriteHandle) ensureLoaded() error {
+	if !f.pending {
+		return nil
+	}
+	f.pending = false
+
 	meta, err := f.client.Stat(f.path)
 	if err != nil {
 		if errors.Is(err, core.ErrNotFound) {
-			return nil
+			return nil // nothing there yet; a fresh write
 		}
 		return err
 	}
@@ -500,6 +512,13 @@ func (f *WriteHandle) Write(ctx context.Context, data []byte, off int64) (uint32
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	// A write that doesn't start at 0 leaves earlier bytes in place, so the old
+	// contents have to be underneath it.
+	if err := f.ensureLoaded(); err != nil {
+		log.Printf("ERR write-load %s: %v", f.path, err)
+		return 0, mapErrno(err)
+	}
+
 	n, err := f.tmp.WriteAt(data, off)
 	if err != nil {
 		log.Printf("ERR write-buf %s: %v", f.path, err)
@@ -508,6 +527,7 @@ func (f *WriteHandle) Write(ctx context.Context, data []byte, off int64) (uint32
 	if end := off + int64(n); end > f.size {
 		f.size = end
 	}
+	f.dirty = true
 	return uint32(n), fs.OK
 }
 
@@ -516,16 +536,35 @@ func (f *WriteHandle) Write(ctx context.Context, data []byte, off int64) (uint32
 func (f *WriteHandle) truncateBuf(size int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if size == 0 {
+		// Everything is being discarded, so there's nothing worth fetching — this
+		// is what makes `> file` cost one upload instead of a full download first.
+		f.pending = false
+	} else if err := f.ensureLoaded(); err != nil {
+		log.Printf("ERR truncate-load %s: %v", f.path, err)
+		return
+	}
+
 	if err := f.tmp.Truncate(size); err != nil {
 		log.Printf("ERR truncate-buf %s: %v", f.path, err)
 		return
 	}
 	f.size = size
+	f.dirty = true
 }
 
 func (f *WriteHandle) flush() syscall.Errno {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if !f.dirty {
+		return fs.OK // opened for writing, never written to
+	}
+	if err := f.ensureLoaded(); err != nil {
+		log.Printf("ERR flush-load %s: %v", f.path, err)
+		return mapErrno(err)
+	}
 	if _, err := f.tmp.Seek(0, io.SeekStart); err != nil {
 		log.Printf("ERR write-seek %s: %v", f.path, err)
 		return syscall.EIO
