@@ -90,9 +90,13 @@ type FileMeta struct {
 	UpdatedAt string  `json:"updated_at"`
 }
 
+// NewClient talks to the Eidos file API. baseURL is the API's full base —
+// including whatever path it's mounted at (e.g. https://app.eidos.my/api/fuse) —
+// so the driver holds no assumption about where the server put its routes;
+// moving them is a config change at the caller, not a rebuild.
 func NewClient(baseURL, token string) *Client {
 	c := &Client{
-		baseURL: baseURL,
+		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
@@ -136,7 +140,7 @@ func (c *Client) Stat(filePath string) (*FileMeta, error) {
 	if v, ok := c.statCache.get(filePath); ok {
 		return v, nil
 	}
-	resp, err := c.do("GET", "/api/fuse/stat?path="+url.QueryEscape(filePath), nil)
+	resp, err := c.do("GET", "/stat?path="+url.QueryEscape(filePath), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +166,7 @@ func (c *Client) List(filePath string) ([]FileMeta, error) {
 	if v, ok := c.listCache.get(filePath); ok {
 		return v, nil
 	}
-	resp, err := c.do("GET", "/api/fuse/list?path="+url.QueryEscape(filePath), nil)
+	resp, err := c.do("GET", "/list?path="+url.QueryEscape(filePath), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +199,7 @@ func (c *Client) List(filePath string) ([]FileMeta, error) {
 // Read returns a file's bytes, fetched on demand (lazy). Scope — which files
 // are visible at all — is enforced server-side by the token, not here.
 func (c *Client) Read(filePath string) ([]byte, error) {
-	resp, err := c.do("GET", "/api/fuse/read?path="+url.QueryEscape(filePath), nil)
+	resp, err := c.do("GET", "/read?path="+url.QueryEscape(filePath), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -214,12 +218,12 @@ func (c *Client) Read(filePath string) ([]byte, error) {
 
 // ReadRange returns bytes [off, off+length) of a file. length <= 0 means "to
 // the end". It lets the driver serve reads through a bounded window instead of
-// pulling a whole file into memory — so a large file no longer OOMs the
-// container. NOTE: under the server's whole-blob AES-CBC encryption a range
-// still costs a full server-side decrypt; this bounds *client* memory, not
-// server work. Cheap server-side ranges need chunked/CTR encryption (deferred).
+// pulling a whole file into memory, so a large file no longer OOMs the
+// container. Assets are stored as independently sealed chunks, so the server
+// fetches and decrypts only the chunks the window covers — the range is cheap
+// on both ends, not just this one.
 func (c *Client) ReadRange(filePath string, off int64, length int) ([]byte, error) {
-	q := "/api/fuse/read?path=" + url.QueryEscape(filePath) + "&offset=" + strconv.FormatInt(off, 10)
+	q := "/read?path=" + url.QueryEscape(filePath) + "&offset=" + strconv.FormatInt(off, 10)
 	if length > 0 {
 		q += "&length=" + strconv.Itoa(length)
 	}
@@ -243,7 +247,7 @@ func (c *Client) ReadRange(filePath string, off int64, length int) ([]byte, erro
 // Truncate sets a file's length to size (shrink cuts, grow zero-fills),
 // server-side. Backs ftruncate()/Setattr(size) and truncating opens.
 func (c *Client) Truncate(filePath string, size int64) error {
-	resp, err := c.do("POST", "/api/fuse/truncate", map[string]any{
+	resp, err := c.do("POST", "/truncate", map[string]any{
 		"path": filePath,
 		"size": size,
 	})
@@ -270,7 +274,7 @@ func (c *Client) Write(filePath string, content []byte, mime string) error {
 	if mime == "" {
 		mime = "text/plain"
 	}
-	resp, err := c.do("POST", "/api/fuse/write", map[string]string{
+	resp, err := c.do("POST", "/write", map[string]string{
 		"path":    filePath,
 		"content": base64.StdEncoding.EncodeToString(content),
 		"mime":    mime,
@@ -298,7 +302,7 @@ func (c *Client) Write(filePath string, content []byte, mime string) error {
 // Chmod persists a file's unix permission bits (backs the chmod() syscall, so
 // `chmod +x` survives across sessions). Only the low 12 bits are kept.
 func (c *Client) Chmod(filePath string, mode uint32) error {
-	resp, err := c.do("POST", "/api/fuse/chmod", map[string]any{
+	resp, err := c.do("POST", "/chmod", map[string]any{
 		"path": filePath,
 		"mode": mode & 0o7777,
 	})
@@ -323,7 +327,7 @@ func (c *Client) Chmod(filePath string, mode uint32) error {
 // Symlink creates a symbolic link at filePath pointing to target (the raw
 // target string, unresolved — POSIX symlink semantics).
 func (c *Client) Symlink(filePath, target string) error {
-	resp, err := c.do("POST", "/api/fuse/symlink", map[string]string{
+	resp, err := c.do("POST", "/symlink", map[string]string{
 		"path":   filePath,
 		"target": target,
 	})
@@ -350,7 +354,7 @@ func (c *Client) WriteStream(filePath string, r io.Reader, size int64, mimeType 
 	if mimeType == "" {
 		mimeType = "text/plain"
 	}
-	u := c.baseURL + "/api/fuse/write-stream?path=" + url.QueryEscape(filePath) + "&mime=" + url.QueryEscape(mimeType)
+	u := c.baseURL + "/write-stream?path=" + url.QueryEscape(filePath) + "&mime=" + url.QueryEscape(mimeType)
 	req, err := http.NewRequest("POST", u, io.LimitReader(r, size))
 	if err != nil {
 		return err
@@ -382,7 +386,7 @@ func (c *Client) WriteStream(filePath string, r io.Reader, size int64, mimeType 
 }
 
 func (c *Client) Mkdir(filePath string) error {
-	resp, err := c.do("POST", "/api/fuse/mkdir", map[string]string{"path": filePath})
+	resp, err := c.do("POST", "/mkdir", map[string]string{"path": filePath})
 	if err != nil {
 		return err
 	}
@@ -395,7 +399,7 @@ func (c *Client) Mkdir(filePath string) error {
 }
 
 func (c *Client) Delete(filePath string) error {
-	resp, err := c.do("DELETE", "/api/fuse/delete?path="+url.QueryEscape(filePath), nil)
+	resp, err := c.do("DELETE", "/delete?path="+url.QueryEscape(filePath), nil)
 	if err != nil {
 		return err
 	}
@@ -409,7 +413,7 @@ func (c *Client) Delete(filePath string) error {
 }
 
 func (c *Client) Rename(from, to string) error {
-	resp, err := c.do("POST", "/api/fuse/rename", map[string]string{"from": from, "to": to})
+	resp, err := c.do("POST", "/rename", map[string]string{"from": from, "to": to})
 	if err != nil {
 		return err
 	}

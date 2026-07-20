@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -16,7 +17,7 @@ import (
 )
 
 func main() {
-	apiURL := flag.String("api", "", "Eidos API base URL (e.g. https://app.eidos.my)")
+	apiURL := flag.String("api", "", "Eidos file API base URL, including its path (e.g. https://app.eidos.my/api/fuse)")
 	token := flag.String("token", "", "Sanctum API token")
 	mount := flag.String("mount", "", "Mount point (e.g. /mnt/eidos)")
 	allowOther := flag.Bool("allow-other", false, "allow users other than the mounter to access the mount (needed when root mounts for the sandbox user)")
@@ -57,17 +58,33 @@ func main() {
 		},
 	}
 
-	server, err := fs.Mount(*mount, fuseimpl.NewRoot(client, local), opts)
+	root := fuseimpl.NewRoot(client, local)
+
+	server, err := fs.Mount(*mount, root, opts)
 	if err != nil {
 		log.Fatalf("mount %s: %v", *mount, err)
 	}
 
 	log.Printf("edfs mounted at %s", *mount)
 
+	// Follow the server's change feed so writes made elsewhere (web UI, agent,
+	// another machine) drop both our cache and the kernel's, instead of lingering
+	// until the attribute timeout. Best-effort: if the feed is off or unreachable
+	// the mount still works, just with TTL-bound freshness.
+	ctx, stopWatching := context.WithCancel(context.Background())
+	defer stopWatching()
+	go client.WatchChanges(ctx, func(change core.Change) {
+		fuseimpl.NotifyPath(root.EmbeddedInode(), change.Path)
+		if change.From != "" {
+			fuseimpl.NotifyPath(root.EmbeddedInode(), change.From)
+		}
+	})
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sig
+		stopWatching()
 		server.Unmount()
 	}()
 
